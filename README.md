@@ -30,7 +30,7 @@ It allows you to manage your server entirely from a browser – start/stop/resta
 - **Configuration Editing** – Edit `server.properties` and mod config files (`.cfg`, `.toml`, `.json`, `.properties`, etc.).  
   **配置文件编辑** – 在线编辑 `server.properties` 以及模组配置文件。
 - **Local LLM Log Analysis** – Send server log to a local OpenAI‑compatible LLM for intelligent analysis (optional).  
-  **本地 AI 日志分析** – 将服务器日志发送到本地 OpenAI 兼容的大模型进行智能分析（可选）。
+  **AI 日志分析** – 将服务器日志发送到 OpenAI 兼容的大模型进行智能分析（可选）。
 - **Guest Page** – Public page for mod downloads (optional include optimisation mods) and online player list (names only).  
   **访客页面** – 公开的模组下载页面（可选择是否包含优化模组）和在线玩家列表（仅显示名称）。
 - **Multi‑User Role System** – Three roles: `root`, `administrator`, `politician`.  
@@ -53,7 +53,7 @@ It allows you to manage your server entirely from a browser – start/stop/resta
 
 - Python 3.8+
 - A running Minecraft server (Forge/NeoForge/Fabric) – **no RCON setup needed**
-- (Optional) A local LLM service with OpenAI‑compatible API (e.g., [LocalAI](https://github.com/mudler/LocalAI), [Ollama](https://ollama.com/))
+- (Optional) A LLM service with OpenAI‑compatible API (e.g., [LocalAI](https://github.com/mudler/LocalAI), [Ollama](https://ollama.com/))
 
 ---
 
@@ -121,9 +121,9 @@ After logging in as root, you can add `administrator` and `politician` users via
 | `--server-path` | current directory | Path to Minecraft server folder |
 | `--start-command` | `java -Xmx2G -Xms1G -jar server.jar nogui` | Full command to start the server |
 | `--world-folder` | `world` | Name of the world folder |
-| `--local-llm-base-url` | `http://localhost:8000/v1` | URL of local LLM service (optional) |
-| `--local-llm-model` | `mc-analyst-v1` | Model name for log analysis (optional) |
-| `--local-llm-api-key` | (empty) | API Key for LLM service (optional) |
+| `--llm-base-url` | `http://localhost:8000/v1` | URL of local LLM service (optional) |
+| `--llm-model` | `mc-analyst-v1` | Model name for log analysis (optional) |
+| `--llm-api-key` | (empty) | API Key for LLM service (optional) |
 | `--root-password` | **required** | Password for the `root` user |
 | `--host` | `0.0.0.0` | Flask listening address |
 | `--port` | `5000` | Flask listening port |
