@@ -12,26 +12,33 @@ import re
 import shutil
 import json
 import argparse
+import select
+import fcntl
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
-from flask import Flask, render_template_string, request, jsonify, send_file, Response, stream_with_context, g
+from flask import Flask, render_template_string, request, jsonify, send_file, Response, stream_with_context, g, redirect, url_for, abort
 from flask_httpauth import HTTPBasicAuth
+import requests
 
 app = Flask(__name__)
 auth = HTTPBasicAuth()
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
-# ================== 全局配置（由命令行参数覆盖） ==================
+# 全局配置（由命令行参数覆盖）
 SERVER_PATH = None
 START_COMMAND = None
 WORLD_FOLDER = None
-LOCAL_LLM_BASE_URL = None
-LOCAL_LLM_MODEL = None
-LOCAL_LLM_API_KEY = None
-ROOT_PASSWORD = None   # root 用户密码，仅从命令行读取
+LLM_BASE_URL = None
+LLM_MODEL = None
+LLM_API_KEY = None
+ROOT_PASSWORD = None
+SERVER_PORT = 25565
+PANEL_HOST = '0.0.0.0'
+PANEL_PORT = 5000
+DEBUG_MODE = False
 
-# ================== 依赖路径 ==================
+# 依赖路径
 MODS_FOLDER = None
 LOG_FILE = None
 CONSOLE_LOG = None
@@ -43,14 +50,14 @@ BANNED_PLAYERS_FILE = None
 OPS_FILE = None
 USERS_FILE = 'users.json'
 
-# ================== 全局状态 ==================
+# 全局状态
 server_process = None
 server_status = "stopped"
 server_pid = None
+server_create_time = None
 console_queue = queue.Queue()
 stop_event = threading.Event()
 read_thread = None
-
 online_players_set = set()
 online_players_lock = threading.Lock()
 player_info_cache = {}
@@ -81,12 +88,10 @@ def authenticate_user(username, password):
     user = users.get(username)
     if user and user.get('password') == password:
         return user.get('role'), None
-    else:
-        return None, '用户名或密码错误'
+    return None, '用户名或密码错误'
 
 # ================== 登录失败限制 ==================
 LOGIN_FAIL_FILE = 'login_fails.json'
-
 def load_login_fails():
     if not os.path.exists(LOGIN_FAIL_FILE):
         return {}
@@ -133,7 +138,7 @@ def clear_fail(ip):
         del data[ip]
         save_login_fails(data)
 
-# ================== 认证与权限装饰器 ==================
+# ================== 认证与权限 ==================
 @auth.verify_password
 def verify_password(username, password):
     ip = request.remote_addr
@@ -154,7 +159,7 @@ def role_required(allowed_roles):
         @wraps(f)
         def decorated(*args, **kwargs):
             if not hasattr(g, 'role') or g.role not in allowed_roles:
-                return jsonify({'error': '权限不足'}), 403
+                abort(403)
             return f(*args, **kwargs)
         return decorated
     return decorator
@@ -187,9 +192,9 @@ def get_log_content(max_lines=500):
         return f"读取日志失败: {e}"
 
 def is_llm_configured():
-    return (LOCAL_LLM_BASE_URL != 'http://localhost:8000/v1' or LOCAL_LLM_MODEL != 'mc-analyst-v1') and LOCAL_LLM_BASE_URL and LOCAL_LLM_MODEL
+    return (LLM_BASE_URL != 'http://localhost:8000/v1' or LLM_MODEL != 'mc-analyst-v1') and LLM_BASE_URL and LLM_MODEL
 
-def analyze_with_local_llm(log_text):
+def analyze_with_llm(log_text):
     if not is_llm_configured():
         return "LLM 未配置"
     if not log_text:
@@ -198,25 +203,32 @@ def analyze_with_local_llm(log_text):
     if len(log_text) > max_chars:
         log_text = log_text[:max_chars] + "\n...(日志过长，已截断)"
     try:
-        import openai
-        client = openai.OpenAI(
-            base_url=LOCAL_LLM_BASE_URL,
-            api_key=LOCAL_LLM_API_KEY or "not-needed"
-        )
-        response = client.chat.completions.create(
-            model=LOCAL_LLM_MODEL,
-            messages=[
+        headers = {
+            'Authorization': f'Bearer {LLM_API_KEY or "not-needed"}',
+            'Content-Type': 'application/json'
+        }
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [
                 {"role": "system", "content": "你是一个 Minecraft 服务器管理助手，请分析以下服务器日志，指出可能的错误、警告或异常，并给出简短建议。"},
                 {"role": "user", "content": log_text}
             ],
-            temperature=0.5,
-            max_tokens=1000
-        )
-        return response.choices[0].message.content
+            "temperature": 0.5,
+            "max_tokens": 1000
+        }
+        base_url = LLM_BASE_URL.rstrip('/')
+        if '/v1' not in base_url:
+            url = base_url + '/v1/chat/completions'
+        else:
+            url = base_url + '/chat/completions'
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        return result['choices'][0]['message']['content']
     except ImportError:
-        return "请安装 openai 库：pip install openai"
+        return "请安装 requests 库：pip install requests"
     except Exception as e:
-        return f"调用本地 LLM 服务失败: {e}"
+        return f"调用 LLM 服务失败: {e}"
 
 # ================== 玩家信息解析 ==================
 def parse_player_info(line):
@@ -512,25 +524,37 @@ def pack_mods_zip(include_optim=False):
 
 # ================== 服务器进程管理 ==================
 def read_output(pipe, log_file):
+    fd = pipe.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
     with open(log_file, 'a', encoding='utf-8') as f:
-        for line in iter(pipe.readline, b''):
-            if not line:
-                break
+        while True:
             try:
-                text = line.decode('utf-8', errors='replace').rstrip()
-            except:
-                text = str(line)
-            f.write(text + '\n')
-            f.flush()
-            console_queue.put(text)
-            parse_player_info(text)
-    pipe.close()
+                rlist, _, _ = select.select([pipe], [], [], 1.0)
+                if not rlist:
+                    if server_process and server_process.poll() is not None:
+                        break
+                    continue
+                line = pipe.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                try:
+                    text = line.decode('utf-8', errors='replace').rstrip()
+                except:
+                    text = str(line)
+                f.write(text + '\n')
+                f.flush()
+                console_queue.put(text)
+            except Exception:
+                pass
 
 def start_server():
-    global server_process, server_status, server_pid, read_thread, stop_event
+    global server_process, server_status, server_pid, read_thread, stop_event, server_create_time
     if server_process and server_process.poll() is None:
         return False, "服务器已在运行中"
-    cmd = START_COMMAND
+    cmd = START_COMMAND.replace('{port}', str(SERVER_PORT))
     logging.info(f"启动命令: {cmd}")
     try:
         server_process = subprocess.Popen(
@@ -552,13 +576,14 @@ def start_server():
             server_status = "stopped"
             return False, "服务器启动后立即退出，请检查控制台日志"
         server_status = "running"
+        server_create_time = time.time()
         return True, "服务器启动成功"
     except Exception as e:
         server_status = "stopped"
         return False, f"启动失败: {e}"
 
 def stop_server():
-    global server_process, server_status, read_thread
+    global server_process, server_status, read_thread, server_create_time
     if not server_process or server_process.poll() is not None:
         server_status = "stopped"
         return False, "服务器未运行"
@@ -584,6 +609,7 @@ def stop_server():
         online_players_set.clear()
     server_process = None
     server_status = "stopped"
+    server_create_time = None
     console_queue.put("[系统] 服务器已停止")
     return True, "服务器已停止"
 
@@ -594,16 +620,56 @@ def restart_server():
     time.sleep(2)
     return start_server()
 
-# ================== 路由（权限控制） ==================
+# ================== 路由 ==================
 @app.route('/')
 @auth.login_required
 def index():
+    if g.role == 'root':
+        return redirect(url_for('root_panel'))
+    elif g.role == 'administrator':
+        return redirect(url_for('administrator_panel'))
+    elif g.role == 'politician':
+        return redirect(url_for('politician_panel'))
+    else:
+        abort(403)
+
+@app.route('/root')
+@auth.login_required
+@role_required(['root'])
+def root_panel():
     return render_template_string(HTML_TEMPLATE, role=g.role)
 
+@app.route('/administrator')
+@auth.login_required
+@role_required(['administrator'])
+def administrator_panel():
+    return render_template_string(HTML_TEMPLATE, role=g.role)
+
+@app.route('/politician')
+@auth.login_required
+@role_required(['politician'])
+def politician_panel():
+    return render_template_string(HTML_TEMPLATE, role=g.role)
+
+# ================== API 路由（权限控制） ==================
 @app.route('/api/server/status')
 @auth.login_required
 def server_status_api():
-    return jsonify({'status': server_status, 'pid': server_pid, 'running': server_process is not None and server_process.poll() is None})
+    global server_status, server_pid, server_create_time
+    if server_process is not None and server_process.poll() is None:
+        return jsonify({
+            'status': 'running',
+            'pid': server_pid,
+            'running': True,
+            'create_time': server_create_time
+        })
+    else:
+        return jsonify({
+            'status': 'stopped',
+            'pid': None,
+            'running': False,
+            'create_time': None
+        })
 
 @app.route('/api/server/start', methods=['POST'])
 @auth.login_required
@@ -631,19 +697,30 @@ def console_stream():
             try:
                 with open(CONSOLE_LOG, 'r', encoding='utf-8', errors='ignore') as f:
                     lines = f.readlines()
-                    for line in lines[-10:]:
+                    start = max(0, len(lines) - 100)
+                    for line in lines[start:]:
                         yield f"data: {line.strip()}\n\n"
             except:
                 pass
+
+        last_heartbeat = time.time()
         while True:
             try:
                 line = console_queue.get(timeout=1)
                 yield f"data: {line}\n\n"
+                last_heartbeat = time.time()
             except queue.Empty:
+                if time.time() - last_heartbeat > 10:
+                    yield f"event: heartbeat\ndata: \n\n"
+                    last_heartbeat = time.time()
                 if server_process and server_process.poll() is not None:
                     yield f"event: close\ndata: 服务器已关闭\n\n"
                     break
                 continue
+            except Exception as e:
+                logging.error(f"SSE 生成器异常: {e}")
+                break
+
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
 @app.route('/api/command', methods=['POST'])
@@ -908,9 +985,9 @@ def get_log():
 @auth.login_required
 def analyze_log():
     if not is_llm_configured():
-        return jsonify({'error': '未配置 LLM 服务，请通过命令行参数 --local-llm-base-url 和 --local-llm-model 启用'}), 400
+        return jsonify({'error': '未配置 LLM 服务，请通过命令行参数 --llm-base-url 和 --llm-model 启用'}), 400
     log_text = get_log_content()
-    analysis = analyze_with_local_llm(log_text)
+    analysis = analyze_with_llm(log_text)
     if analysis == "LLM 未配置":
         return jsonify({'error': '未配置 LLM 服务'}), 400
     return jsonify({'analysis': analysis})
@@ -1033,8 +1110,7 @@ def add_user():
     users[username] = {'password': password, 'role': role}
     if save_users(users):
         return jsonify({'success': True})
-    else:
-        return jsonify({'error': '保存失败'}), 500
+    return jsonify({'error': '保存失败'}), 500
 
 @app.route('/api/users/<username>', methods=['DELETE'])
 @auth.login_required
@@ -1048,8 +1124,7 @@ def delete_user(username):
     del users[username]
     if save_users(users):
         return jsonify({'success': True})
-    else:
-        return jsonify({'error': '保存失败'}), 500
+    return jsonify({'error': '保存失败'}), 500
 
 @app.route('/api/users/<username>/password', methods=['PUT'])
 @auth.login_required
@@ -1065,8 +1140,7 @@ def change_user_password(username):
     users[username]['password'] = new_password
     if save_users(users):
         return jsonify({'success': True})
-    else:
-        return jsonify({'error': '保存失败'}), 500
+    return jsonify({'error': '保存失败'}), 500
 
 # ================== 访客路由 ==================
 @app.route('/guests')
@@ -1088,14 +1162,14 @@ def guests_mods_download():
                      download_name=f'mods{suffix}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip',
                      mimetype='application/zip')
 
-# ================== 前端模板（管理面板） ==================
+# ================== 前端模板 ==================
 HTML_TEMPLATE = r'''
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Minecraft 服务器管理器</title>
+    <title>MSMP - Minecraft 服务器管理器</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { padding-top: 2rem; background-color: #f8f9fa; }
@@ -1115,9 +1189,9 @@ HTML_TEMPLATE = r'''
 </head>
 <body>
 <div class="container">
-    <h1 class="mb-4">📦 Minecraft 服务器管理器</h1>
+    <h1 class="mb-4">📦 MSMP – Minecraft Server Management Panel</h1>
 
-    <!-- 服务器控制卡片 -->
+    <!-- 服务器控制 -->
     <div class="card">
         <div class="card-header bg-dark text-white">🖥️ 服务器控制</div>
         <div class="card-body">
@@ -1135,7 +1209,7 @@ HTML_TEMPLATE = r'''
         </div>
     </div>
 
-    <!-- 在线玩家卡片 -->
+    <!-- 在线玩家 -->
     <div class="card">
         <div class="card-header bg-primary text-white">👥 在线玩家</div>
         <div class="card-body">
@@ -1149,7 +1223,7 @@ HTML_TEMPLATE = r'''
         </div>
     </div>
 
-    <!-- 权限管理卡片 -->
+    <!-- 权限管理 -->
     <div class="card">
         <div class="card-header bg-danger text-white">🚫 权限管理</div>
         <div class="card-body">
@@ -1172,7 +1246,7 @@ HTML_TEMPLATE = r'''
         </div>
     </div>
 
-    <!-- 用户管理卡片（仅 root 可见） -->
+    <!-- 用户管理（仅 root） -->
     <div id="userManagementCard" class="card" style="display: none;">
         <div class="card-header bg-dark text-white">👥 用户管理</div>
         <div class="card-body">
@@ -1195,7 +1269,7 @@ HTML_TEMPLATE = r'''
         </div>
     </div>
 
-    <!-- 高级模块（root 和 administrator 可见） -->
+    <!-- 高级模块（root 和 administrator） -->
     <div id="advancedModules" style="display: none;">
         <div class="card"><div class="card-header bg-info text-white">📺 控制台输出 (实时)</div><div class="card-body"><div id="console" class="console-box"></div></div></div>
         <div class="card"><div class="card-header bg-primary text-white">💬 执行服务器指令</div><div class="card-body"><div class="input-group mb-3"><input type="text" id="commandInput" class="form-control" placeholder="例如 /say Hello"><button id="sendCommandBtn" class="btn btn-primary">发送</button></div><div id="commandResult" class="alert alert-secondary mt-2" style="display:none;"></div></div></div>
@@ -1240,7 +1314,7 @@ HTML_TEMPLATE = r'''
     window.changePassword=async(username)=>{const newPass=prompt('输入新密码：'); if(!newPass)return; const resp=await fetch(`/api/users/${username}/password`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:newPass})}); const data=await resp.json(); if(data.success)alert('密码修改成功'); else alert('修改失败:'+data.error);};
     document.getElementById('addUserBtn').onclick=async()=>{const username=document.getElementById('newUsername').value.trim(); const password=document.getElementById('newPassword').value.trim(); const role=document.getElementById('newRole').value; if(!username||!password){alert('用户名和密码不能为空');return;} const resp=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password,role})}); const data=await resp.json(); if(data.success){alert('添加成功'); loadUsers(); document.getElementById('newUsername').value=''; document.getElementById('newPassword').value='';}else alert('添加失败:'+data.error);};
 
-    // 其他高级功能函数（仅当 isAdmin 时存在元素）
+    // 其他高级功能
     async function loadMods(){if(!isAdmin)return; const d=await(await fetch('/api/mods')).json(); const list=document.getElementById('modList'); if(!list)return; list.innerHTML=''; d.mods.forEach(mod=>{const li=document.createElement('li'); li.className='list-group-item d-flex justify-content-between align-items-center'; li.innerHTML=`${mod} <button class="btn btn-sm btn-danger" onclick="deleteMod('${mod}')">删除</button>`; list.appendChild(li);});}
     window.deleteMod=async(filename)=>{if(confirm(`删除模组 ${filename}？`)){const resp=await fetch(`/api/mods/${filename}`,{method:'DELETE'}); if(resp.ok)loadMods(); else alert('删除失败');}};
     document.getElementById('uploadForm') && document.getElementById('uploadForm').addEventListener('submit',async(e)=>{e.preventDefault(); const fd=new FormData(e.target); const resp=await fetch('/api/mods',{method:'POST',body:fd}); if(resp.ok){alert('上传成功'); loadMods(); e.target.reset();}else alert('上传失败');});
@@ -1262,7 +1336,60 @@ HTML_TEMPLATE = r'''
     document.getElementById('saveConfigBtn') && (document.getElementById('saveConfigBtn').onclick=async()=>{if(!currentConfigFile)return; const content=document.getElementById('configEditor').value; const data=await(await fetch('/api/config/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:currentConfigFile,content})})).json(); const msgDiv=document.getElementById('configSaveMsg'); if(data.success){msgDiv.innerHTML='<div class="alert alert-success">保存成功！请重启服务器生效。</div>'; if(configCache[currentConfigFile]){configCache[currentConfigFile].content=content; const mt=await fetch(`/api/config/mtime?path=${encodeURIComponent(currentConfigFile)}`); const mtData=await mt.json(); if(!mtData.error)configCache[currentConfigFile].mtime=mtData.mtime;}}else msgDiv.innerHTML='<div class="alert alert-danger">保存失败:'+data.error+'</div>';});
     document.getElementById('analyzeLogBtn') && (document.getElementById('analyzeLogBtn').onclick=async()=>{const loading=document.getElementById('analysisLoading'); const resultDiv=document.getElementById('analysisResult'); const textDiv=document.getElementById('analysisText'); loading.style.display='block'; resultDiv.style.display='none'; try{const resp=await fetch('/api/analyze_log',{method:'POST'}); const data=await resp.json(); if(data.error){alert(data.error); return;} textDiv.textContent=data.analysis; resultDiv.style.display='block';}catch(err){alert('分析失败:'+err);}finally{loading.style.display='none';}});
     document.getElementById('sendCommandBtn') && (document.getElementById('sendCommandBtn').onclick=async()=>{const cmd=document.getElementById('commandInput').value.trim(); if(!cmd)return alert('请输入指令'); const resultDiv=document.getElementById('commandResult'); resultDiv.style.display='block'; resultDiv.textContent='发送中...'; try{const resp=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:cmd})}); const data=await resp.json(); if(data.error){resultDiv.textContent='错误:'+data.error; resultDiv.className='alert alert-danger';}else{resultDiv.textContent='命令已发送'; resultDiv.className='alert alert-success';}}catch(err){resultDiv.textContent='请求失败:'+err; resultDiv.className='alert alert-danger';}});
-    const consoleDiv=document.getElementById('console'); if(consoleDiv){const evtSource=new EventSource('/api/console/stream'); evtSource.onmessage=e=>{consoleDiv.innerHTML+=e.data+'<br>'; consoleDiv.scrollTop=consoleDiv.scrollHeight;}; evtSource.addEventListener('close',e=>{consoleDiv.innerHTML+='[系统] '+e.data+'<br>'; evtSource.close();}); evtSource.onerror=err=>console.error("SSE 错误:",err);}
+
+    // ========== 日志 SSE 连接（带自动重连） ==========
+    let evtSource = null;
+    let reconnectTimer = null;
+
+    function connectConsole() {
+        if (evtSource) {
+            evtSource.close();
+        }
+        const consoleDiv = document.getElementById('console');
+        evtSource = new EventSource('/api/console/stream');
+
+        evtSource.onmessage = (event) => {
+            consoleDiv.innerHTML += event.data + '<br>';
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        };
+
+        evtSource.addEventListener('heartbeat', (event) => {
+            // 心跳消息，不做任何操作，仅保持连接
+        });
+
+        evtSource.addEventListener('close', (event) => {
+            consoleDiv.innerHTML += '[系统] ' + event.data + '<br>';
+            evtSource.close();
+            // 尝试重连（3秒后）
+            reconnectTimer = setTimeout(() => {
+                connectConsole();
+            }, 3000);
+        });
+
+        evtSource.onerror = (err) => {
+            console.error("SSE 错误:", err);
+            if (evtSource.readyState === EventSource.CLOSED) {
+                // 连接已关闭，尝试重连
+                reconnectTimer = setTimeout(() => {
+                    connectConsole();
+                }, 3000);
+            }
+        };
+    }
+
+    // 页面加载时建立连接
+    connectConsole();
+
+    // 页面卸载时关闭连接
+    window.addEventListener('beforeunload', () => {
+        if (evtSource) {
+            evtSource.close();
+        }
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+        }
+    });
+
     document.getElementById('startBtn').onclick=async()=>{const d=await(await fetch('/api/server/start',{method:'POST'})).json(); alert(d.message); updateStatus();};
     document.getElementById('stopBtn').onclick=async()=>{const d=await(await fetch('/api/server/stop',{method:'POST'})).json(); alert(d.message); updateStatus();};
     document.getElementById('restartBtn').onclick=async()=>{const d=await(await fetch('/api/server/restart',{method:'POST'})).json(); alert(d.message); updateStatus();};
@@ -1279,20 +1406,19 @@ HTML_TEMPLATE = r'''
 </html>
 '''
 
-# ================== 访客页面模板 ==================
 GUESTS_TEMPLATE = r'''
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Minecraft 服务器 - 访客页面</title>
+    <title>MSMP - 访客</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>body{padding-top:2rem;background-color:#f8f9fa}.container{max-width:800px}.card{margin-bottom:1.5rem}.player-list{max-height:300px;overflow-y:auto}</style>
 </head>
 <body>
 <div class="container">
-    <h1 class="mb-4">🎮 Minecraft 服务器 - 访客入口</h1>
+    <h1 class="mb-4">🎮 MSMP – 访客入口</h1>
     <div class="card">
         <div class="card-header bg-primary text-white">📦 模组下载</div>
         <div class="card-body text-center">
@@ -1314,16 +1440,17 @@ GUESTS_TEMPLATE = r'''
 
 # ================== 命令行参数解析 ==================
 def parse_args():
-    parser = argparse.ArgumentParser(description='Minecraft 服务器管理面板')
+    parser = argparse.ArgumentParser(description='MSMP – Minecraft Server Management Panel')
     parser.add_argument('--server-path', default=os.getcwd(), help='服务器工作目录')
-    parser.add_argument('--start-command', default='java -Xmx2G -Xms1G -jar server.jar nogui', help='启动命令')
+    parser.add_argument('--start-command', default='java -Xmx2G -Xms1G -jar server.jar nogui', help='启动命令（可使用 {port} 占位符）')
     parser.add_argument('--world-folder', default='world', help='世界文件夹名称')
-    parser.add_argument('--local-llm-base-url', default='http://localhost:8000/v1', help='本地 LLM 服务地址（可选）')
-    parser.add_argument('--local-llm-model', default='mc-analyst-v1', help='本地 LLM 模型名称（可选）')
-    parser.add_argument('--local-llm-api-key', default='', help='本地 LLM API Key（可选）')
+    parser.add_argument('--llm-base-url', default='http://localhost:8000/v1', help='本地 LLM 地址（可选）')
+    parser.add_argument('--llm-model', default='mc-analyst-v1', help='本地 LLM 模型（可选）')
+    parser.add_argument('--llm-api-key', default='', help='本地 LLM API Key（可选）')
+    parser.add_argument('--server-port', type=int, default=25565, help='Minecraft 服务器监听端口（替换 {port}）')
     parser.add_argument('--root-password', required=True, help='root 用户密码（必填）')
     parser.add_argument('--host', default='0.0.0.0', help='监听地址')
-    parser.add_argument('--port', type=int, default=5000, help='监听端口')
+    parser.add_argument('--port', type=int, default=5000, help='面板端口')
     parser.add_argument('--debug', action='store_true', help='调试模式')
     return parser.parse_args()
 
@@ -1332,17 +1459,17 @@ if __name__ == '__main__':
     SERVER_PATH = args.server_path
     START_COMMAND = args.start_command
     WORLD_FOLDER = args.world_folder
-    LOCAL_LLM_BASE_URL = args.local_llm_base_url
-    LOCAL_LLM_MODEL = args.local_llm_model
-    LOCAL_LLM_API_KEY = args.local_llm_api_key
+    LLM_BASE_URL = args.llm_base_url
+    LLM_MODEL = args.llm_model
+    LLM_API_KEY = args.llm_api_key
+    SERVER_PORT = args.server_port
     ROOT_PASSWORD = args.root_password
 
-    # 打印启动配置
     print("=" * 50)
-    print("Minecraft 服务器管理面板启动")
+    print("MSMP – Minecraft Server Management Panel")
     print(f"服务器目录: {SERVER_PATH}")
+    print(f"服务器端口: {SERVER_PORT}")
     print(f"root 密码: {'*' * len(ROOT_PASSWORD)}")
-    print(f"本地 LLM: {LOCAL_LLM_BASE_URL} (模型: {LOCAL_LLM_MODEL})")
     print(f"LLM 启用: {'是' if is_llm_configured() else '否'}")
     print("=" * 50)
 
