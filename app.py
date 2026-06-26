@@ -12,8 +12,6 @@ import re
 import shutil
 import json
 import argparse
-import select
-import fcntl
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
@@ -524,20 +522,15 @@ def pack_mods_zip(include_optim=False):
 
 # ================== 服务器进程管理 ==================
 def read_output(pipe, log_file):
-    fd = pipe.fileno()
-    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
+    """跨平台线程阻塞读取，将输出放入队列"""
     with open(log_file, 'a', encoding='utf-8') as f:
         while True:
             try:
-                rlist, _, _ = select.select([pipe], [], [], 1.0)
-                if not rlist:
-                    if server_process and server_process.poll() is not None:
-                        break
-                    continue
                 line = pipe.readline()
                 if not line:
+                    # 检查进程是否退出
+                    if server_process and server_process.poll() is not None:
+                        break
                     time.sleep(0.1)
                     continue
                 try:
@@ -548,7 +541,9 @@ def read_output(pipe, log_file):
                 f.flush()
                 console_queue.put(text)
             except Exception:
-                pass
+                if server_process and server_process.poll() is not None:
+                    break
+                time.sleep(0.1)
 
 def start_server():
     global server_process, server_status, server_pid, read_thread, stop_event, server_create_time
@@ -1162,7 +1157,7 @@ def guests_mods_download():
                      download_name=f'mods{suffix}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip',
                      mimetype='application/zip')
 
-# ================== 前端模板 ==================
+# ================== 前端模板（完整） ==================
 HTML_TEMPLATE = r'''
 <!DOCTYPE html>
 <html lang="zh-CN">
